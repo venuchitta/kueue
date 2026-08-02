@@ -880,13 +880,25 @@ func (m *Manager) CleanUpOnContext(ctx context.Context) {
 // Heads returns the heads of the queues, along with their associated ClusterQueue.
 // It blocks if the queues empty until they have elements or the context terminates.
 func (m *Manager) Heads(ctx context.Context) []workload.Info {
+	workloads := m.waitForHeads(ctx)
+	// Logged after waitForHeads released the lock. The Manager lock is exclusive
+	// and Heads is on the scheduler's hot path, so log I/O must stay out of that
+	// critical section. Only a non-empty result is reported: an empty one means
+	// the context is done, which the caller already handles.
+	if len(workloads) != 0 {
+		ctrl.LoggerFrom(ctx).V(3).Info("Obtained ClusterQueue heads", "count", len(workloads))
+	}
+	return workloads
+}
+
+// waitForHeads pops the heads of the queues, blocking until at least one is
+// available or ctx is done. It holds the Manager's exclusive lock throughout,
+// except while parked in m.cond.Wait, which releases it.
+func (m *Manager) waitForHeads(ctx context.Context) []workload.Info {
 	m.Lock()
 	defer m.Unlock()
-	log := ctrl.LoggerFrom(ctx)
 	for {
-		workloads := m.heads()
-		log.V(3).Info("Obtained ClusterQueue heads", "count", len(workloads))
-		if len(workloads) != 0 {
+		if workloads := m.heads(); len(workloads) != 0 {
 			return workloads
 		}
 		select {

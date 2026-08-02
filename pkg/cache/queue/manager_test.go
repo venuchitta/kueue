@@ -1932,6 +1932,142 @@ func TestHeadsCancelledNoLostWakeup(t *testing.T) {
 	}
 }
 
+const headsLogMsg = "Obtained ClusterQueue heads"
+
+// headsLogRecorder collects the headsLogMsg entries emitted through the logger it
+// installs on a context. Heads may log from another goroutine, so the collected
+// entries are guarded.
+type headsLogRecorder struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (r *headsLogRecorder) intoContext(ctx context.Context) context.Context {
+	logger := funcr.New(func(_, args string) {
+		if strings.Contains(args, headsLogMsg) {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			r.got = append(r.got, args)
+		}
+	}, funcr.Options{Verbosity: 3})
+	return logr.NewContext(ctx, logger)
+}
+
+func (r *headsLogRecorder) entries() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.got...)
+}
+
+// countingStatusChecker counts ClusterQueueActive calls. Manager.heads calls it
+// for every ClusterQueue, so a rising count shows that heads ran again.
+type countingStatusChecker struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (c *countingStatusChecker) ClusterQueueActive(kueue.ClusterQueueReference) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	return true
+}
+
+func (c *countingStatusChecker) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls
+}
+
+// TestHeadsObtainedLogging verifies that Heads reports the heads it obtained only
+// when there are some. The log call used to sit inside the loop that holds the
+// Manager's exclusive lock, so it also ran on every broadcast wakeup that yielded
+// nothing.
+func TestHeadsObtainedLogging(t *testing.T) {
+	t.Run("no entry for a broadcast wakeup that yields no workloads", func(t *testing.T) {
+		rec := &headsLogRecorder{}
+		checker := &countingStatusChecker{}
+		ctx, cancel := context.WithCancel(rec.intoContext(t.Context()))
+		defer cancel()
+
+		manager := NewManagerForUnitTests(utiltesting.NewFakeClient(), checker)
+		if err := manager.AddClusterQueue(ctx, utiltestingapi.MakeClusterQueue("cq").Obj()); err != nil {
+			t.Fatalf("Failed adding clusterQueue: %v", err)
+		}
+		go manager.CleanUpOnContext(ctx)
+
+		headsDone := make(chan []workload.Info, 1)
+		go func() {
+			headsDone <- manager.Heads(ctx)
+		}()
+
+		// Let Heads find nothing and park in cond.Wait.
+		waitForGoroutine(t, "sync.(*Cond).Wait", headsTimeout)
+
+		// Wake it with a broadcast that yields no workloads and wait until it has
+		// re-run heads. Broadcasting in a loop avoids a lost wakeup in case Heads
+		// has not parked yet. This is the wakeup that must not log.
+		before := checker.callCount()
+		deadline := time.Now().Add(headsTimeout)
+		for checker.callCount() == before {
+			manager.Broadcast()
+			if time.Now().After(deadline) {
+				t.Fatal("timed out waiting for Heads to process a broadcast wakeup")
+			}
+			runtime.Gosched()
+		}
+
+		if got := rec.entries(); len(got) != 0 {
+			t.Errorf("Got %d %q entries for a wakeup yielding no workloads, want 0: %v", len(got), headsLogMsg, got)
+		}
+
+		// Cancel so that Heads returns instead of leaking the goroutine.
+		cancel()
+		select {
+		case heads := <-headsDone:
+			if len(heads) != 0 {
+				t.Fatalf("Heads returned %d workloads, want 0", len(heads))
+			}
+		case <-time.After(headsTimeout):
+			t.Fatal("Heads did not return after the context was cancelled")
+		}
+		if got := rec.entries(); len(got) != 0 {
+			t.Errorf("Got %d %q entries, want 0: %v", len(got), headsLogMsg, got)
+		}
+	})
+
+	t.Run("entry emitted when workloads are present", func(t *testing.T) {
+		rec := &headsLogRecorder{}
+		ctx, cancel := context.WithTimeout(rec.intoContext(t.Context()), headsTimeout)
+		defer cancel()
+		log := logr.FromContextOrDiscard(ctx)
+
+		manager := NewManagerForUnitTests(utiltesting.NewFakeClient(), nil, WithPreemptionExpectations(preemptexpectations.New()))
+		if err := manager.AddClusterQueue(ctx, utiltestingapi.MakeClusterQueue("cq").Obj()); err != nil {
+			t.Fatalf("Failed adding clusterQueue: %v", err)
+		}
+		if err := manager.AddLocalQueue(ctx, utiltestingapi.MakeLocalQueue("foo", "").ClusterQueue("cq").Obj()); err != nil {
+			t.Fatalf("Failed adding localQueue: %v", err)
+		}
+		wl := utiltestingapi.MakeWorkload("a", "").Creation(time.Now().Truncate(time.Second)).Queue("foo").Obj()
+		if err := manager.AddOrUpdateWorkload(log, wl); err != nil {
+			t.Fatalf("Failed adding workload: %v", err)
+		}
+
+		heads := manager.Heads(ctx)
+		if len(heads) != 1 {
+			t.Fatalf("Heads returned %d workloads, want 1", len(heads))
+		}
+		got := rec.entries()
+		if len(got) != 1 {
+			t.Fatalf("Got %d %q entries, want 1: %v", len(got), headsLogMsg, got)
+		}
+		if !strings.Contains(got[0], `"count"=1`) {
+			t.Errorf("Entry %q does not report a count of 1", got[0])
+		}
+	})
+}
+
 // waitForGoroutine polls runtime.Stack until a goroutine whose stack contains
 // the given substring is found, or the timeout expires.
 func waitForGoroutine(t *testing.T, substr string, timeout time.Duration) {
